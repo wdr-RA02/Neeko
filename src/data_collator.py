@@ -65,7 +65,8 @@ class DynamicDataCollatorWithPadding(DataCollatorWithPadding):
             batch["labels"] = labels
 
         if "role_embds" in features[0]:
-            batch["role_embds"] = torch.stack([torch.tensor(feature["role_embds"]).clone().detach().flip(0) for feature in features], dim=0)
+            # batch["role_embds"] = torch.stack([torch.tensor(feature["role_embds"]).clone().detach().flip(0) for feature in features], dim=0)
+            batch["role_embds"] = torch.stack([torch.tensor(feature["role_embds"]).clone().detach() for feature in features], dim=0)
 
         batch["input_ids"] = input_ids
         batch["attention_mask"] = self.get_attention_masks(input_ids, device=input_ids.device)
