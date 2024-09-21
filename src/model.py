@@ -272,7 +272,7 @@ def load_pretrained(
     if model_args.quantization_bit is not None:
         if model_args.quantization_bit == 8:
             require_version("bitsandbytes>=0.37.0", "To fix: pip install bitsandbytes>=0.37.0")
-            config_kwargs["load_in_8bit"] = True
+            # config_kwargs["load_in_8bit"] = True
             config_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_8bit=True,
                 llm_int8_threshold=6.0
@@ -282,7 +282,7 @@ def load_pretrained(
             require_version("transformers>=4.30.1", "To fix: pip install transformers>=4.30.1")
             require_version("accelerate>=0.20.3", "To fix: pip install accelerate>=0.20.3")
             require_version("peft>=0.4.0.dev0", "To fix: pip install git+https://github.com/huggingface/peft.git")
-            config_kwargs["load_in_4bit"] = True
+            # config_kwargs["load_in_4bit"] = True
             config_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=model_args.compute_dtype,
@@ -302,6 +302,7 @@ def load_pretrained(
         model_to_load = model_args.model_name_or_path
 
     # Load and prepare pretrained models (without valuehead).
+    # print(config_kwargs)
     model = AutoModelForCausalLM.from_pretrained(
         model_to_load,
         config=config,

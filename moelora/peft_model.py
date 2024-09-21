@@ -35,6 +35,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import QuestionAnsweringModelOutput, SequenceClassifierOutput, TokenClassifierOutput
 from transformers.utils import PushToHubMixin
 
+from peft import PeftModel as PMBase
 from . import __version__
 from .tuners import (
     AdaLoraModel,
@@ -74,7 +75,7 @@ PEFT_TYPE_TO_MODEL_MAPPING = {
 }
 
 
-class PeftModel(PushToHubMixin, torch.nn.Module):
+class PeftModel(PMBase):
     """
     Base model encompassing various Peft methods.
 
@@ -99,25 +100,28 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
     """
 
     def __init__(self, model: PreTrainedModel, peft_config: PeftConfig, adapter_name: str = "default"):
-        super().__init__()
-        self.base_model = model
-        self.config = self.base_model.config
+        torch.nn.Module.__init__(self)
         self.modules_to_save = None
-        self.peft_config = {}
         self.active_adapter = adapter_name
         self.peft_type = peft_config.peft_type
-        self.base_model_torch_dtype = getattr(model, "dtype", None)
-        if not isinstance(peft_config, PromptLearningConfig):
-            self.peft_config[adapter_name] = peft_config
-            self.base_model = PEFT_TYPE_TO_MODEL_MAPPING[peft_config.peft_type](
-                self.base_model, self.peft_config, adapter_name
-            )
-            self.set_additional_trainable_modules(peft_config, adapter_name)
-        else:
-            self.add_adapter(adapter_name, peft_config)
+        # These args are special PEFT arguments that users can pass. They need to be removed before passing them to
+        # forward.
+        self.special_peft_forward_args = {"adapter_names"}
+
+        # self._is_prompt_learning = False
+        self._peft_config = None
+        cls = PEFT_TYPE_TO_MODEL_MAPPING[peft_config.peft_type]
+        self.base_model = cls(model, {adapter_name: peft_config}, adapter_name)
+        self.set_additional_trainable_modules(peft_config, adapter_name)
 
         if getattr(model, "is_gradient_checkpointing", True):
             model = self._prepare_model_for_gradient_checkpointing(model)
+
+        # the `pretraining_tp` is set for some models to simulate Tensor Parallelism during inference to avoid
+        # numerical differences, https://github.com/pytorch/pytorch/issues/76232 - to avoid any unexpected
+        # behavior we disable that in this line.
+        if hasattr(self.base_model, "config") and hasattr(self.base_model.config, "pretraining_tp"):
+            self.base_model.config.pretraining_tp = 1
 
     def save_pretrained(self, save_directory: str, safe_serialization: bool = False, **kwargs: Any):
         r"""
