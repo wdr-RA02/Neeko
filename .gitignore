@@ -1,0 +1,4 @@
+**/__pycache__/
+character_llm/
+ckpt/
+wandb/
