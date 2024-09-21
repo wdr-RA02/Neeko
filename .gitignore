@@ -2,3 +2,7 @@
 character_llm/
 ckpt/
 wandb/
+
+**/.vscode/
+data/role_embds/
+data/*.jsonl
