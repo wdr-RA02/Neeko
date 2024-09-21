@@ -7,7 +7,6 @@ from moelora import PeftModel
 import argparse
 import os
 import csv
-from src.generation import generate_prompt, evaluate
 
 ROLE_PROFILE_MAPPING={
         "Beethoven": "",
@@ -78,12 +77,61 @@ def parse_arguments():
     return args
 
 
+def generate_prompt(character: str, inputs: List):
+    prompt = """I want you to act like {character}. I want you to respond and answer like {character}, using the tone, manner and vocabulary {character} would use. You must know all of the knowledge of {character}. 
+
+The status of you is as follows:
+Location: Coffee Shop - Afternoon
+Status: {character} is casually chatting with a man from the 21st century. {character} fully trusts the man who engage in conversation and shares everything {character} knows without reservation.
+
+The interactions are as follows:
+
+{history}{character} (speaking): """
+    history = ""
+    for dialog in inputs:
+        history += f"{dialog['role']} {dialog['action']}: {dialog['content']}" + "</s>"
+    prompted = prompt.format(character=character, history=history)
+    return prompted
+
+def evaluate(
+            tokenizer,
+            model,
+            character,
+            inputs=None,
+            temperature=0.1,
+            top_p=0.7,
+            top_k=40,
+            num_beams=3,
+            max_new_tokens=512,
+            **kwargs,
+    ):
+        prompt = generate_prompt(character, inputs)
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].cuda()
+        generation_config = GenerationConfig(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            num_beams=num_beams,
+            **kwargs,
+        )
+        with torch.no_grad():
+            generation_output = model.generate(
+                input_ids=input_ids,
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=True,
+                max_new_tokens=max_new_tokens,
+            )
+        s = generation_output.sequences[0]
+        output = tokenizer.decode(s)
+        print(output)
+        return output.split(f"(speaking): ")[-1].strip().replace("</s>", "")
+
+
 def main(args):
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     tokenizer = LlamaTokenizer.from_pretrained(args.LLM, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = 0
-    
     model = AutoModelForCausalLM.from_pretrained(
             args.LLM,
             # load_in_8bit=True,
@@ -165,7 +213,7 @@ def main(args):
                 "action": "(speaking)",
                 "content": one["question"]
             }]
-            res = evaluate(model=model, tokenizer=tokenizer, character=args.character, inputs=inputs)
+            res = evaluate(tokenizer=tokenizer, model=model, character=args.character, inputs=inputs)
             reply = {
                 "role": args.character,
                 "action": "(speaking)",
