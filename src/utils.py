@@ -291,7 +291,8 @@ def prepare_args() -> Tuple[ModelArguments, DataTrainingArguments, Seq2SeqTraini
     assert (not training_args.do_predict) or training_args.predict_with_generate, \
         "Please enable `predict_with_generate` to save model predictions."
 
-    assert model_args.quantization_bit is None or finetuning_args.finetuning_type == "lora", \
+    assert model_args.quantization_bit is None or (finetuning_args.finetuning_type == "lora" \
+                                                   or finetuning_args.finetuning_type == "moelora"), \
         "Quantization is only compatible with the LoRA method."
 
     if model_args.checkpoint_dir is not None:
@@ -343,7 +344,8 @@ def prepare_infer_args() -> Tuple[ModelArguments, DataTrainingArguments, Finetun
     else:
         model_args, data_args, finetuning_args, generating_args = parser.parse_args_into_dataclasses()
 
-    assert model_args.quantization_bit is None or finetuning_args.finetuning_type == "lora", \
+    assert model_args.quantization_bit is None or (finetuning_args.finetuning_type == "lora" \
+                                                   or finetuning_args.finetuning_type == "moelora"), \
         "Quantization is only compatible with the LoRA method."
 
     if model_args.checkpoint_dir is not None:

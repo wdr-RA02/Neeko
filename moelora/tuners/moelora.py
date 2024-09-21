@@ -640,7 +640,7 @@ class Linear(nn.Linear, MoeLoraLayer):
             r: int = 0,
             num_moe: int = 0,
             gating: str = "",
-            global_role_embd: List = [],
+            global_role_embd: List = None,
             lora_alpha: int = 1,
             lora_dropout: float = 0.0,
             fan_in_fan_out: bool = False,
@@ -660,6 +660,8 @@ class Linear(nn.Linear, MoeLoraLayer):
         self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
         self.global_role_embd = global_role_embd
+        if self.global_role_embd is None:
+            self.global_role_embd = []
 
     def merge(self):
         if self.active_adapter not in self.lora_A.keys():
@@ -960,9 +962,9 @@ if is_bnb_available():
                 r: int = 0,
                 num_moe: int = 0,
                 gating: str = "",
-                loss_fn: str = "",
                 lora_alpha: int = 1,
                 lora_dropout: float = 0.0,
+                global_role_embd: List = None,
                 **kwargs,
         ):
             bnb.nn.Linear8bitLt.__init__(
@@ -980,46 +982,55 @@ if is_bnb_available():
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
             init_lora_weights = kwargs.pop("init_lora_weights", True)
-            self.update_layer(adapter_name, r, num_moe, gating, loss_fn, lora_alpha, lora_dropout, init_lora_weights)
+            self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights)
             self.active_adapter = adapter_name
+
+            self.global_role_embd = global_role_embd
+            if self.global_role_embd is None:
+                self.global_role_embd = []
 
         def forward(self, x: torch.Tensor):
             result = super().forward(x)
             batch_size, seq_len, _ = x.size()
             if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
                 return result
+
             elif self.r[self.active_adapter] > 0:
+                r_single = self.r[self.active_adapter] // self.num_moe[self.active_adapter]
+                n = self.num_moe[self.active_adapter]
+
                 if not torch.is_autocast_enabled():
                     expected_dtype = result.dtype
 
                     if x.dtype != torch.float32:
                         x = x.float()
+                    # lora_A_out: (b,s,r_single,n)
+                    A_out = (self.lora_A[self.active_adapter](
+                                self.lora_dropout[self.active_adapter](x)
+                            )).reshape(batch_size, seq_len, r_single, n)
+                    
+                    B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
+                    B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
+                    # B_out = [bsnd]
+                    gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
 
-                    output = (self.lora_B[self.active_adapter](
-                        (
-                                (self.lora_A[self.active_adapter](
-                                    self.lora_dropout[self.active_adapter](x)
-                                )).reshape(batch_size, seq_len,
-                                           self.r[self.active_adapter] // self.num_moe[self.active_adapter], -1)
-                                * self.gating[self.active_adapter](x)
-                        ).reshape(batch_size, seq_len, -1)
-                    ).to(expected_dtype)
-                              * self.scaling[self.active_adapter]
-                              )
+                    output = (B_out * gating).sum(dim=-2)
+                    output = output.reshape(batch_size, seq_len, -1).to(expected_dtype) * self.scaling[self.active_adapter]
+                              
                 else:
-                    output = (
-                            self.lora_B[self.active_adapter](
-                                (
-                                        (self.lora_A[self.active_adapter](
-                                            self.lora_dropout[self.active_adapter](x)
-                                        )).reshape(batch_size, seq_len,
-                                                   self.r[self.active_adapter] // self.num_moe[self.active_adapter], -1)
-                                        * self.gating[self.active_adapter](x)
-                                ).reshape(batch_size, seq_len, -1)
-                            )
-                            * self.scaling[self.active_adapter]
-                    )
+                    A_out = (self.lora_A[self.active_adapter](
+                                self.lora_dropout[self.active_adapter](x)
+                            )).reshape(batch_size, seq_len, r_single, n)
+                    
+                    B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
+                    B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
+                    # B_out = [bsnd]
+                    gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
+                    output = (B_out * gating).sum(dim=-2)
+                    output = output.reshape(batch_size, seq_len, -1) * self.scaling[self.active_adapter]
+                
                 result += output
+
             return result
 
 
@@ -1028,14 +1039,17 @@ if is_bnb_available():
         class Linear4bit(bnb.nn.Linear4bit, MoeLoraLayer):
             # Lora implemented in a dense layer
             def __init__(
-                    self,
-                    adapter_name,
-                    in_features,
-                    out_features,
-                    r: int = 0,
-                    lora_alpha: int = 1,
-                    lora_dropout: float = 0.0,
-                    **kwargs,
+                self,
+                adapter_name,
+                in_features,
+                out_features,
+                r: int = 0,
+                num_moe: int = 0,
+                gating: str = "",
+                lora_alpha: int = 1,
+                lora_dropout: float = 0.0,
+                global_role_embd: List = None,
+                **kwargs,
             ):
                 bnb.nn.Linear4bit.__init__(
                     self,
@@ -1050,10 +1064,15 @@ if is_bnb_available():
 
                 # Freezing the pre-trained weight matrix
                 self.weight.requires_grad = False
-
                 init_lora_weights = kwargs.pop("init_lora_weights", True)
-                self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+                self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights)
+                init_lora_weights = kwargs.pop("init_lora_weights", True)
+                
+                # self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
                 self.active_adapter = adapter_name
+                self.global_role_embd = global_role_embd
+                if self.global_role_embd is None:
+                    self.global_role_embd = []
 
             def forward(self, x: torch.Tensor):
                 result = super().forward(x)
@@ -1061,22 +1080,45 @@ if is_bnb_available():
                 if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
                     return result
                 elif self.r[self.active_adapter] > 0:
-                    result = result.clone()
+                    # result = result.clone()                    
+                    n = self.num_moe[self.active_adapter]
+                    r_single = self.r[self.active_adapter] // n
+                    batch_size, seq_len, _ = x.shape
+
                     if not torch.is_autocast_enabled():
                         expected_dtype = result.dtype
                         x = x.to(self.lora_A[self.active_adapter].weight.dtype)
-                        output = (
-                                self.lora_B[self.active_adapter](
-                                    self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
-                                ).to(expected_dtype)
-                                * self.scaling[self.active_adapter]
-                        )
+                        
+                        A_out = (self.lora_A[self.active_adapter](
+                                self.lora_dropout[self.active_adapter](x)
+                            )).reshape(batch_size, seq_len, r_single, n)
+                    
+                        B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
+                        B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
+                        # B_out = [bsnd]
+                        gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
+
+                        output = (B_out * gating).sum(dim=-2)
+                        output = output.reshape(batch_size, seq_len, -1).to(expected_dtype) * self.scaling[self.active_adapter]
+
                     else:
-                        output = (
-                                self.lora_B[self.active_adapter](
-                                    self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
-                                )
-                                * self.scaling[self.active_adapter]
-                        )
+                        # output = (
+                        #         self.lora_B[self.active_adapter](
+                        #             self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
+                        #         )
+                        #         * self.scaling[self.active_adapter]
+                        # )
+                        A_out = (self.lora_A[self.active_adapter](
+                                self.lora_dropout[self.active_adapter](x)
+                            )).reshape(batch_size, seq_len, r_single, n)
+                    
+                        B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
+                        B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
+                        # B_out = [bsnd]
+                        gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
+                        output = (B_out * gating).sum(dim=-2)
+                        output = output.reshape(batch_size, seq_len, -1) * self.scaling[self.active_adapter]
+
                     result += output
+
                 return result
