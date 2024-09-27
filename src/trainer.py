@@ -62,7 +62,9 @@ class LLaMaTrainer:
             "top_p": 0.7,
             "max_new_tokens": self.data_args.max_target_length + 1,
             "temperature": 0.95,
-            "logits_processor": get_logits_processor()
+            "logits_processor": get_logits_processor(),
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": 0 if not self.tokenizer.pad_token_id is None else self.tokenizer.pad_token_id,
         }
 
     def train(self):

@@ -32,13 +32,22 @@ class ComputeMetrics:
         score_dict = {"rouge-1": [], "rouge-2": [], "rouge-l": [], "bleu-4": []}
 
         for pred, label in zip(preds, labels):
-            pred_pad_len, label_pad_len = np.sum(pred == IGNORE_INDEX), np.sum(label == IGNORE_INDEX)
-            pred = pred[len(label) - label_pad_len : len(pred) - pred_pad_len] # remove prompts
-            label = label[:len(label) - label_pad_len]
+            # pred_pad_len, label_pad_len = np.sum(pred == IGNORE_INDEX), np.sum(label == IGNORE_INDEX)
+            # pred = pred[len(label) - label_pad_len : len(pred) - pred_pad_len] # remove prompts
+            # label = label[:len(label) - label_pad_len]
 
-            hypothesis = list(jieba.cut(self.tokenizer.decode(pred, skip_special_tokens=True)))
-            reference = list(jieba.cut(self.tokenizer.decode(label, skip_special_tokens=True)))
+            # 从label中获取!=-100的下标值
+            pred = pred[np.nonzero(label != IGNORE_INDEX)]
+            pred_parts = np.split(pred, np.nonzero(pred==self.tokenizer.eos_token_id)[0])
 
+            label = label[np.nonzero(label != IGNORE_INDEX)]
+            label_parts = np.split(label, np.where(label==2)[0])
+            
+            hypo = [self.tokenizer.decode(s, skip_special_tokens=True) for s in pred_parts]
+            ref = [self.tokenizer.decode(s, skip_special_tokens=True) for s in label_parts]
+
+            hypothesis = list(jieba.cut(" ".join(hypo)))
+            reference = list(jieba.cut(" ".join(ref)))
             if len(" ".join(hypothesis).split()) == 0:
                 result = {"rouge-1": {"f": 0.0}, "rouge-2": {"f": 0.0}, "rouge-l": {"f": 0.0}}
             else:
@@ -77,13 +86,16 @@ class Seq2SeqPeftTrainer(PeftTrainer):
         with open(output_prediction_file, "w", encoding="utf-8") as writer:
             res: List[str] = []
             for pred, label in zip(predict_results.predictions, predict_results.label_ids):
-                pred_pad_len, label_pad_len = np.sum(pred == IGNORE_INDEX), np.sum(label == IGNORE_INDEX)
-                pred = pred[len(label) - label_pad_len : len(pred) - pred_pad_len] # remove prompts
-                label = label[:len(label) - label_pad_len]
+                pred = pred[np.nonzero(label != IGNORE_INDEX)]
+                pred_parts = np.split(pred, np.nonzero(pred==self.tokenizer.eos_token_id)[0])
 
-                pred = self.tokenizer.decode(pred, skip_special_tokens=True)
-                label = self.tokenizer.decode(label, skip_special_tokens=True)
+                label = label[np.nonzero(label != IGNORE_INDEX)]
+                label_parts = np.split(label, np.where(label==2)[0])
+                
+                pred_sents = [self.tokenizer.decode(s, skip_special_tokens=True) for s in pred_parts]
+                label_sents = [self.tokenizer.decode(s, skip_special_tokens=True) for s in label_parts]
 
-                res.append(json.dumps({"label": label, "predict": pred}, ensure_ascii=False))
+                res.extend(json.dumps({"label": l, "predict": p}, ensure_ascii=False)\
+                            for l, p in zip(pred_sents, label_sents))
 
             writer.write("\n".join(res))
