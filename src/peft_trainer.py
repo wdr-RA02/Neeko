@@ -13,6 +13,7 @@ from transformers import (
     TrainingArguments
 )
 
+from tqdm.auto import tqdm
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.modeling_utils import unwrap_model
 
@@ -29,7 +30,7 @@ from .model import (
     load_valuehead_params
 )
 
-
+from transformers.training_args import ParallelMode
 logger = get_logger(__name__)
 
 
@@ -72,6 +73,32 @@ class LogCallback(TrainerCallback):
         with open(os.path.join(args.output_dir, "trainer_log.jsonl"), "a") as f:
             f.write(json.dumps(log_dict) + "\n")
 
+class AuxLossCallback(TrainerCallback):
+    aux_loss: float = None
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs) -> None:
+        if (
+            state.log_history[-1].get("step") % state.logging_steps == 0
+            and self.aux_loss is not None
+        ):
+            tqdm.write("aux_loss: {:.5f}".format(self.aux_loss))
+
+    def on_substep_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        model = kwargs["model"]
+        if hasattr(model.base_model, "aux_losses"):
+            model.base_model.aux_losses.clear()
+        
+        return super().on_substep_end(args, state, control, **kwargs)
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        model = kwargs["model"]
+        if hasattr(model.base_model, "aux_losses"):
+            aux_loss = torch.mean(torch.stack(model.base_model.aux_losses[-1]).detach()).item()
+            self.aux_loss = round(aux_loss, 5)
+            model.base_model.aux_losses.clear()
+        else:
+            self.aux_loss = None
+        
+        return super().on_step_end(args, state, control, **kwargs)
 
 class PeftTrainer(Seq2SeqTrainer):
     r"""
@@ -139,3 +166,13 @@ class PeftTrainer(Seq2SeqTrainer):
                 })
         else: # freeze/full-tuning
             load_trainable_params(backbone_model, self.state.best_model_checkpoint)
+
+    def _wrap_model(self, model, training=True, dataloader=None):
+        model = super()._wrap_model(model, training, dataloader)
+        # required for training auxiliary loss with input attached
+        if not self.is_fsdp_xla_enabled and self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+            self.accelerator.ddp_handler.static_graph = True
+        
+        return model
+
+    

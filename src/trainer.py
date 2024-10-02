@@ -8,7 +8,7 @@ from .dataset import (
 
 )
 from .model import load_pretrained, plot_loss
-from .peft_trainer import LogCallback
+from .peft_trainer import LogCallback, AuxLossCallback
 from .seq2seq import Seq2SeqPeftTrainer, ComputeMetrics
 from .template import Template
 from .utils import prepare_args, get_logits_processor
@@ -56,7 +56,10 @@ class LLaMaTrainer:
             **trainer_kwargs
         )
 
+        if self.finetuning_args.finetuning_type == "moelora":
         # Keyword arguments for `model.generate`
+            self.trainer.add_callback(AuxLossCallback())
+
         self.gen_kwargs = {
             "do_sample": True,
             "top_p": 0.7,

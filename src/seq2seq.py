@@ -12,6 +12,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from .peft_trainer import PeftTrainer
 from .utils import get_logger, IGNORE_INDEX
 
+import torch
 
 logger = get_logger(__name__)
 
@@ -99,3 +100,35 @@ class Seq2SeqPeftTrainer(PeftTrainer):
                             for l, p in zip(pred_sents, label_sents))
 
             writer.write("\n".join(res))
+
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        if self.finetuning_args.finetuning_type != "moelora":
+            return super().compute_loss(model, inputs, return_outputs)
+        
+        # add aux_loss in model list
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        output = super().compute_loss(model, inputs, True)
+        try:
+            # num_moe = unwrapped_model.active_peft_config.num_moe
+            aux_losses = unwrapped_model.base_model.aux_losses
+        except AttributeError:
+            print("aux_losses does not exist")
+        except Exception as e:
+            print("other exception ", e)
+        else:
+            all_loss = None
+            if len(aux_losses) > 0:
+                all_loss = torch.stack(aux_losses[-1], dim=-1)
+                all_loss = torch.mean(all_loss, dim=-1)
+
+        total_loss = output[0]
+        if isinstance(all_loss, torch.Tensor) and isinstance(output[0], torch.Tensor):
+            total_loss = output[0] + all_loss
+        
+        if isinstance(output[1], dict):
+            output[1]["loss"] = total_loss
+        else:
+            output[1][0] = total_loss
+        
+        return (total_loss, output[1]) if return_outputs else total_loss

@@ -166,6 +166,14 @@ class FinetuningArguments:
         default="Standard",
         metadata={"help": "Select the Gating Network"}
     )
+    gate_noise_norm: Optional[float] = field(
+        default=0.01,
+        metadata={"help": "(for DenseWithMask gating only) the norm of noise injected to logits, defaults to 0.01"}
+    )
+    gate_loss_alpha: Optional[float] = field(
+        default=0.1,
+        metadata={"help": "(for DenseWithMask gating only) the loss factor for training auxiliary loss, defaults to 0.1"}
+    )
     lora_alpha: Optional[int] = field(
         default=32.0,
         metadata={"help": "The scale factor for LoRA fine-tuning (similar with the learning rate)."}

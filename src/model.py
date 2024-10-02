@@ -154,7 +154,7 @@ def _init_adapter(
             assert load_trainable_params(model, model_args.checkpoint_dir[0]), "Model checkpoint is not correctly loaded."
     
     if finetuning_args.finetuning_type == "lora":
-        from peft import PeftModel, LoraConfig, TaskType, get_peft_model
+        from moelora import PeftModel, LoraConfig, TaskType, get_peft_model
         logger.info("Fine-tuning method: LoRA")
         lastest_checkpoint = None
 
@@ -225,12 +225,35 @@ def _init_adapter(
                 gating=finetuning_args.gating,
                 lora_alpha=finetuning_args.lora_alpha,
                 lora_dropout=finetuning_args.lora_dropout,
-                target_modules=finetuning_args.lora_target
+                target_modules=finetuning_args.lora_target,
+                gate_loss_alpha=finetuning_args.gate_loss_alpha,
+                gate_noise_norm=finetuning_args.gate_noise_norm,
             )
             model = get_peft_model(model, moe_lora_config)
 
     if model_args.checkpoint_dir is not None:
         logger.info("Loaded fine-tuned model from checkpoint(s): {}".format(",".join(model_args.checkpoint_dir)))
+
+    if "lora" in finetuning_args.finetuning_type:
+        prefix = "base_model.model.model."
+        max_length = 0
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                # cast all training param to float32
+                p.data = p.data.to(torch.float32)
+            max_length = max(max_length, len(n))
+
+        max_length -= len(prefix)
+        print("Trainable parameters: ")
+        print("="*50)
+        for n, p in model.named_parameters():
+            name = n.removeprefix(prefix).ljust(max_length)
+
+            if p.requires_grad:
+                # cast all training param to float32
+                print("{}\t{}".format(name, p.dtype, sep="\t"))
+        
+        print("="*50)
 
     return model
 
@@ -307,7 +330,7 @@ def load_pretrained(
         model_to_load,
         config=config,
         torch_dtype=torch.bfloat16 if model_args.compute_dtype == torch.bfloat16 else torch.float16,
-        low_cpu_mem_usage=True,
+        # low_cpu_mem_usage=True,
         **config_kwargs
     )
     model = prepare_model_for_training(model, finetuning_args.finetuning_type) if is_trainable else model

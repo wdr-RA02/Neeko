@@ -109,6 +109,15 @@ class MoeLoraConfig(PeftConfig):
         },
     )
 
+    gate_noise_norm: Optional[float] = field(
+        default=0.01,
+        metadata={"help": "(for DenseWithMask gating only) the norm of noise injected to logits, defaults to 0.01"}
+    )
+    gate_loss_alpha: Optional[float] = field(
+        default=0.1,
+        metadata={"help": "(for DenseWithMask gating only) the loss factor for training auxiliary loss, defaults to 0.1"}
+    )
+
     def __post_init__(self):
         self.peft_type = PeftType.MOELORA
 
@@ -175,14 +184,23 @@ class MoeLoraModel(torch.nn.Module):
         self.model = model
         # self.forward = self.model.forward
         self.peft_config = config
-        self.global_role_embd=[]
+        self.global_role_embd = []
+        self.role_ids = []
+        self.aux_losses = []
         self.add_adapter(adapter_name, self.peft_config[adapter_name])
     
     def forward(self, **kwargs):
-        if self.training:
+        # print(len(self.aux_losses))
+        if "role_embds" in kwargs:
             self.global_role_embd.clear()
-            role_embds = kwargs.pop('role_embds')
+            role_embds = kwargs.pop("role_embds")
             self.global_role_embd.extend([role_embds])
+
+        if "role_ids" in kwargs:
+            self.role_ids.clear()
+            role_ids = kwargs.pop("role_ids")
+            self.role_ids.extend([role_ids])
+            
         return self.model(**kwargs)
 
     def add_adapter(self, adapter_name, config=None):
@@ -241,10 +259,14 @@ class MoeLoraModel(torch.nn.Module):
             "num_moe": moelora_config.num_moe,
             "gating": moelora_config.gating,
             "global_role_embd": self.global_role_embd,
+            "role_ids": self.role_ids,
+            "aux_losses": self.aux_losses,
             "lora_alpha": moelora_config.lora_alpha,
             "lora_dropout": moelora_config.lora_dropout,
             "fan_in_fan_out": moelora_config.fan_in_fan_out,
             "init_lora_weights": moelora_config.init_lora_weights,
+            "gate_loss_alpha": moelora_config.gate_loss_alpha,
+            "gate_noise_norm": moelora_config.gate_noise_norm,
         }
         loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
@@ -341,6 +363,8 @@ class MoeLoraModel(torch.nn.Module):
                     moelora_config.lora_alpha,
                     moelora_config.lora_dropout,
                     moelora_config.init_lora_weights,
+                    moelora_config.gate_loss_alpha,
+                    moelora_config.gate_noise_norm,
                 )
             else:
                 new_module = self._create_new_module(moelora_config, adapter_name, target)
@@ -531,11 +555,19 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
 
 
 class MoeLoraLayer:
-    def __init__(self, in_features: int, out_features: int, **kwargs):
+    def __init__(self, in_features: int, out_features: int, 
+                global_role_embd: List = None,
+                role_ids: List = None,
+                aux_losses: List = None,
+                 **kwargs):
         self.r = {}
         self.num_moe = {}
         self.lora_alpha = {}
         self.scaling = {}
+        # for gating
+        self.gate_loss_alpha = {}
+        self.gate_noise_norm = {}
+
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
@@ -548,15 +580,33 @@ class MoeLoraLayer:
         self.disable_adapters = False
         self.in_features = in_features
         self.out_features = out_features
+
+        self.global_role_embd = global_role_embd
+        self.role_ids = role_ids
+        self.aux_losses = aux_losses
+
+        if self.global_role_embd is None:
+            self.global_role_embd = []
+        if self.role_ids is None:
+            self.role_ids = []
+        if self.aux_losses is None:
+            self.aux_losses = []
+        
         self.kwargs = kwargs
 
     def update_layer(self, adapter_name, r, num_moe, gating, lora_alpha, lora_dropout,
-                     init_lora_weights):
+                     init_lora_weights, gate_loss_alpha, gate_noise_norm):
         self.r[adapter_name] = r
         self.num_moe[adapter_name] = num_moe
         self.lora_alpha[adapter_name] = lora_alpha
+
+        self.gate_loss_alpha[adapter_name] = gate_loss_alpha
+        self.gate_noise_norm[adapter_name] = gate_noise_norm
+
         self.gating.update(
-            nn.ModuleDict({adapter_name: GATING_TO_MODEL_MAPPING[gating](self.in_features, num_moe)}))
+            nn.ModuleDict({adapter_name: GATING_TO_MODEL_MAPPING[gating](
+                self.in_features, num_moe, loss_alpha=gate_loss_alpha, noise_norm=gate_noise_norm,
+            )}))
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
         else:
@@ -641,6 +691,8 @@ class Linear(nn.Linear, MoeLoraLayer):
             num_moe: int = 0,
             gating: str = "",
             global_role_embd: List = None,
+            role_ids: List = None,
+            aux_losses: List = None,
             lora_alpha: int = 1,
             lora_dropout: float = 0.0,
             fan_in_fan_out: bool = False,
@@ -648,20 +700,24 @@ class Linear(nn.Linear, MoeLoraLayer):
             **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        gate_loss_alpha = kwargs.pop("gate_loss_alpha", None)
+        gate_noise_norm = kwargs.pop("gate_noise_norm", None)
 
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
-        MoeLoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+        MoeLoraLayer.__init__(self, in_features=in_features, out_features=out_features, 
+                              global_role_embd=global_role_embd, role_ids=role_ids,
+                              aux_losses=aux_losses)
         # Freezing the pre-trained weight matrix
         self.weight.requires_grad = False
         self.fan_in_fan_out = fan_in_fan_out
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
         nn.Linear.reset_parameters(self)
-        self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, 
+                          lora_dropout, init_lora_weights, 
+                          gate_loss_alpha=gate_loss_alpha, gate_noise_norm=gate_noise_norm)
         self.active_adapter = adapter_name
-        self.global_role_embd = global_role_embd
-        if self.global_role_embd is None:
-            self.global_role_embd = []
+
 
     def merge(self):
         if self.active_adapter not in self.lora_A.keys():
@@ -703,6 +759,7 @@ class Linear(nn.Linear, MoeLoraLayer):
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
         batch_size, seq_len, _ = x.size()
+
         if self.active_adapter not in self.lora_A.keys():
             return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
         if self.disable_adapters:
@@ -716,9 +773,30 @@ class Linear(nn.Linear, MoeLoraLayer):
             A_out = self.lora_A[self.active_adapter](
                 self.lora_dropout[self.active_adapter](x)
                 ).reshape(batch_size, seq_len, self.num_moe[self.active_adapter], -1)
+            # b_out: [b,s,n,d]
             B_out = self.calculate_B(A_out)
-            Gate = self.gating[self.active_adapter](self.global_role_embd[0]).unsqueeze(1).unsqueeze(-1)
-            result += ((B_out * Gate).sum(dim=-2) * self.scaling[self.active_adapter])
+
+            ### AUX_LOSS Part OK ###
+            with torch.enable_grad():
+                gate = self.gating[self.active_adapter]
+                if isinstance(getattr(gate, "role_ids"), list):
+                    gate.role_ids.clear()
+                    if len(self.role_ids) > 0:
+                        gate.role_ids.append(self.role_ids[0])
+                
+                loss, gate_logits = gate(self.global_role_embd[0])
+                if isinstance(loss, torch.Tensor):
+                    if len(self.aux_losses) == 0:
+                        self.aux_losses.append((loss,))
+                    else:
+                        self.aux_losses[-1] += (loss,)
+                
+            gate_probs = F.softmax(gate_logits, dim=-1)[:, None, :, None]
+            
+            ### AUXLOSS ###
+            # gate_probs = gate_probs[:, None, :, None]
+            result += ((B_out * gate_probs).sum(dim=-2) * self.scaling[self.active_adapter])
+
         else:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
@@ -965,8 +1043,13 @@ if is_bnb_available():
                 lora_alpha: int = 1,
                 lora_dropout: float = 0.0,
                 global_role_embd: List = None,
+                role_ids: List = None,
+                aux_losses: List = None,
                 **kwargs,
         ):
+            gate_loss_alpha = kwargs.pop("gate_loss_alpha", None)
+            gate_noise_norm = kwargs.pop("gate_noise_norm", None)
+            
             bnb.nn.Linear8bitLt.__init__(
                 self,
                 in_features,
@@ -977,17 +1060,16 @@ if is_bnb_available():
                 threshold=kwargs.get("threshold", 0.0),
                 index=kwargs.get("index", None),
             )
-            MoeLoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+            MoeLoraLayer.__init__(self, in_features=in_features, out_features=out_features, 
+                                global_role_embd=global_role_embd, role_ids=role_ids,
+                                aux_losses=aux_losses)
 
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
             init_lora_weights = kwargs.pop("init_lora_weights", True)
-            self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights)
+            self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights,
+                              gate_loss_alpha=gate_loss_alpha, gate_noise_norm=gate_noise_norm)
             self.active_adapter = adapter_name
-
-            self.global_role_embd = global_role_embd
-            if self.global_role_embd is None:
-                self.global_role_embd = []
 
         def forward(self, x: torch.Tensor):
             result = super().forward(x)
@@ -1011,12 +1093,28 @@ if is_bnb_available():
                     
                     B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
                     B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
-                    # B_out = [bsnd]
-                    gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
 
-                    output = (B_out * gating).sum(dim=-2)
-                    output = output.reshape(batch_size, seq_len, -1).to(expected_dtype) * self.scaling[self.active_adapter]
-                              
+                    ### AUX_LOSS Part OK ###
+                    with torch.enable_grad():
+                        gate = self.gating[self.active_adapter]
+                        if isinstance(getattr(gate, "role_ids"), list):
+                            gate.role_ids.clear()
+                        if len(self.role_ids) > 0:
+                            gate.role_ids.append(self.role_ids[0])
+                        
+                        loss, gate_logits = gate(self.global_role_embd[0])
+                        if isinstance(loss, torch.Tensor):
+                            if len(self.aux_losses) == 0:
+                                self.aux_losses.append((loss,))
+                            else:
+                                self.aux_losses[-1] += (loss,)
+                        
+                    gate_probs = F.softmax(gate_logits, dim=-1)[:, None, :, None]
+                
+                    output = (B_out * gate_probs).sum(dim=-2)
+                    output = output.reshape(batch_size, seq_len, -1).to(expected_dtype) \
+                             * self.scaling[self.active_adapter]
+
                 else:
                     A_out = (self.lora_A[self.active_adapter](
                                 self.lora_dropout[self.active_adapter](x)
@@ -1025,8 +1123,26 @@ if is_bnb_available():
                     B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
                     B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
                     # B_out = [bsnd]
-                    gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
-                    output = (B_out * gating).sum(dim=-2)
+
+                    ### AUX_LOSS Part OK ###
+                    with torch.enable_grad():
+                        gate = self.gating[self.active_adapter]
+                        if isinstance(getattr(gate, "role_ids"), list):
+                            gate.role_ids.clear()
+                            if len(self.role_ids) > 0:
+                                gate.role_ids.append(self.role_ids[0])
+                        
+                        loss, gate_logits = gate(self.global_role_embd[0])
+                        if isinstance(loss, torch.Tensor):
+                            if len(self.aux_losses) == 0:
+                                self.aux_losses.append((loss,))
+                            else:
+                                self.aux_losses[-1] += (loss,)
+                        
+                    gate_probs = F.softmax(gate_logits, dim=-1)[:, None, :, None]
+                    ## TODO 1. 
+                    # loss, logits, probs
+                    output = (B_out * gate_probs).sum(dim=-2)
                     output = output.reshape(batch_size, seq_len, -1) * self.scaling[self.active_adapter]
                 
                 result += output
@@ -1049,8 +1165,12 @@ if is_bnb_available():
                 lora_alpha: int = 1,
                 lora_dropout: float = 0.0,
                 global_role_embd: List = None,
+                role_ids: List = None,
+                aux_losses: List = None,
                 **kwargs,
             ):
+                gate_loss_alpha = kwargs.pop("gate_loss_alpha", None)
+                gate_noise_norm = kwargs.pop("gate_noise_norm", None)
                 bnb.nn.Linear4bit.__init__(
                     self,
                     in_features,
@@ -1060,19 +1180,20 @@ if is_bnb_available():
                     compress_statistics=kwargs.get("compress_statistics", True),
                     quant_type=kwargs.get("quant_type", "nf4"),
                 )
-                MoeLoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+                MoeLoraLayer.__init__(self, in_features=in_features, out_features=out_features, 
+                                    global_role_embd=global_role_embd, role_ids=role_ids,
+                                    aux_losses=aux_losses)
 
                 # Freezing the pre-trained weight matrix
                 self.weight.requires_grad = False
                 init_lora_weights = kwargs.pop("init_lora_weights", True)
-                self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights)
+                self.update_layer(adapter_name, r, num_moe, gating, lora_alpha, lora_dropout, init_lora_weights,
+                                  gate_loss_alpha=gate_loss_alpha, gate_noise_norm=gate_noise_norm)
                 init_lora_weights = kwargs.pop("init_lora_weights", True)
                 
                 # self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+                self.role_ids = role_ids
                 self.active_adapter = adapter_name
-                self.global_role_embd = global_role_embd
-                if self.global_role_embd is None:
-                    self.global_role_embd = []
 
             def forward(self, x: torch.Tensor):
                 result = super().forward(x)
@@ -1096,18 +1217,30 @@ if is_bnb_available():
                         B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
                         B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
                         # B_out = [bsnd]
-                        gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
 
-                        output = (B_out * gating).sum(dim=-2)
-                        output = output.reshape(batch_size, seq_len, -1).to(expected_dtype) * self.scaling[self.active_adapter]
+                        ### AUX_LOSS Part OK ###
+                        with torch.enable_grad():
+                            gate = self.gating[self.active_adapter]
+                            if isinstance(getattr(gate, "role_ids"), list):
+                                gate.role_ids.clear()
+                                if len(self.role_ids) > 0:
+                                    gate.role_ids.append(self.role_ids[0])
+                            
+                            loss, gate_logits = gate(self.global_role_embd[0])
+                            if isinstance(loss, torch.Tensor):
+                                if len(self.aux_losses) == 0:
+                                    self.aux_losses.append((loss,))
+                                else:
+                                    self.aux_losses[-1] += (loss,)
+
+                        ### AUX_LOSS END ###
+                        gate_probs = F.softmax(gate_logits, dim=-1)[:, None, :, None]
+                    
+                        output = (B_out * gate_probs).sum(dim=-2)
+                        output = output.reshape(batch_size, seq_len, -1).to(expected_dtype) \
+                                * self.scaling[self.active_adapter]
 
                     else:
-                        # output = (
-                        #         self.lora_B[self.active_adapter](
-                        #             self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
-                        #         )
-                        #         * self.scaling[self.active_adapter]
-                        # )
                         A_out = (self.lora_A[self.active_adapter](
                                 self.lora_dropout[self.active_adapter](x)
                             )).reshape(batch_size, seq_len, r_single, n)
@@ -1115,8 +1248,25 @@ if is_bnb_available():
                         B_weight = self.lora_B[self.active_adapter].weight.t().reshape(r_single, n, -1)
                         B_out = torch.einsum("bsrn, rnd->bsnd", A_out, B_weight)
                         # B_out = [bsnd]
-                        gating = self.gating[self.active_adapter](self.global_role_embd[0])[:, None, :, None]
-                        output = (B_out * gating).sum(dim=-2)
+
+                        with torch.enable_grad():
+                            gate = self.gating[self.active_adapter]
+                            if isinstance(getattr(gate, "role_ids"), list):
+                                gate.role_ids.clear()
+                                if len(self.role_ids) > 0:
+                                    gate.role_ids.append(self.role_ids[0])
+                            
+                            loss, gate_logits = gate(self.global_role_embd[0])
+                            if isinstance(loss, torch.Tensor):
+                                if len(self.aux_losses) == 0:
+                                    self.aux_losses.append((loss,))
+                                else:
+                                    self.aux_losses[-1] += (loss,)
+                                    
+                        ### AUX_LOSS END ###
+                        gate_probs = F.softmax(gate_logits, dim=-1)[:, None, :, None]
+                    
+                        output = (B_out * gate_probs).sum(dim=-2)
                         output = output.reshape(batch_size, seq_len, -1) * self.scaling[self.active_adapter]
 
                     result += output
