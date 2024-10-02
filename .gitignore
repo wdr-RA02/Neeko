@@ -5,4 +5,5 @@ wandb/
 
 **/.vscode/
 data/role_embds/
+data/myinfer/
 data/*.jsonl
