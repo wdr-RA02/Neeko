@@ -9,19 +9,21 @@ import os
 import csv
 from src.generation import generate_prompt, evaluate
 
+from sentence_transformers import SentenceTransformer
+
 ROLE_PROFILE_MAPPING={
-        "Beethoven": "",
-        "Caesar": "",
-        "Cleopatra": "",
-        "Hermione": "",
-        "Martin": "",
-        "Newton": "",
-        "Socrates": "",
-        "Spartacus": "",
-        "Voldemort": "",
-    }
+    "Beethoven": "",
+    "Cleopatra": "",
+    "Hermione": "",
+    "Martin": "",
+    "Newton": "",
+    "Socrates": "",
+    "Spartacus": "",
+    "Voldemort": "",
+    "Caesar": "",
+}
 for k in ROLE_PROFILE_MAPPING.keys():
-    ROLE_PROFILE_MAPPING[k] = torch.load(os.path.join("/path/to/your/role_embds", k + ".pth")).unsqueeze(0).cuda()
+    ROLE_PROFILE_MAPPING[k] = torch.load(os.path.join("./data/role_embds", k + ".pth")).unsqueeze(0)
 
 
 def read_profile(path):
@@ -36,33 +38,20 @@ def read_profile(path):
 
 ROLE_PROFILE_TEXT={}
 for k in ROLE_PROFILE_MAPPING.keys():
-    profile = read_profile(os.path.join("/path/to/your/seed_data/profiles", "wiki_" + k + ".txt"))
+    profile = read_profile(os.path.join("./data/seed_data/profiles", "wiki_" + k + ".txt"))
     ROLE_PROFILE_TEXT[profile] = k
-
-def mean_pooling(model_output, attention_mask):
-    token_embeddings = model_output[0] #First element of model_output contains all token embeddings
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-
-def get_s_bert():
-    tokenizer = AutoTokenizer.from_pretrained('KBLab/sentence-bert-swedish-cased')
-    model = AutoModel.from_pretrained('KBLab/sentence-bert-swedish-cased')
-    return tokenizer, model
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Infer")
 
     parser.add_argument(
-        "--infer_path", type=str, default="/home/tongxuluo/Neeko/seed_data/questions/generated_agent_interview_Beethoven.json", help="path of json."
+        "--infer_path", type=str, default="./data/seed_data/questions", help="path of all jsons."
     )
     parser.add_argument(
-        "--save_path", type=str, default='/home/tongxuluo/Neeko/results/Neeko/Beethoven_single.json'
+        "--save_path", type=str, default='./infer/'
     )
     parser.add_argument(
-        "--LLM", type=str, default="/home/tongxuluo/models/Llama-2-7b-hf"
-    )
-    parser.add_argument(
-        "--character", type=str, default="Beethoven"
+        "--LLM", type=str, required=True,
     )
     parser.add_argument(
         "--lora_path", type=str, default="/home/tongxuluo/Neeko/ckpt/neeko/wo_caesar/20240203140411"
@@ -84,45 +73,64 @@ def main(args):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
     
+    print("Loading model from ", args.LLM)
     model = AutoModelForCausalLM.from_pretrained(
             args.LLM,
             # load_in_8bit=True,
             torch_dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True,
-        ) # fix zwq
+        ).eval() # fix zwq
+    
+    print("Loading PEFT from ", args.lora_path)
     model = PeftModel.from_pretrained(
             model,
             args.lora_path,
             torch_dtype=torch.float16,
             device_map="auto"
-        )
+        ).eval()
+    
+    
+    ckpt = "dunzhang/stella_en_400M_v5"
+    s_bert = SentenceTransformer(ckpt, trust_remote_code=True, device=model.device)
+
+    with torch.no_grad():
+        sent = list(ROLE_PROFILE_TEXT.keys())
+        profile_embds = s_bert.encode(sent, prompt="s2s_prompt")
+
+    for character in ROLE_PROFILE_MAPPING:
+        result = eval_single(model, tokenizer, args, character=character, profile_embds=profile_embds, s_bert=s_bert)
+        suffix = "multi.jsonl" if args.multi_turns else "single.json"
+
+        with open(os.path.join(args.save_path, f"{character}_{suffix}"), "w") as f:
+            f.write(result)
+        
+        print("*"*50)
+
+
+def eval_single(model, tokenizer, args, character:str, profile_embds, s_bert):
+    # select the most near character
+    eval_results = []
+
     if hasattr(model, "global_role_embd"):
-        s_tokenizer, s_bert = get_s_bert()
-        scores = []
-        for k,v in ROLE_PROFILE_TEXT.items():
-            sentences = [f'I want you to act like {args.character}', k]
-            encoded_input = s_tokenizer(sentences, padding=True, truncation=True, return_tensors='pt')
-
-            with torch.no_grad():
-                model_output = s_bert(**encoded_input)
-
-            # Perform pooling. In this case, max pooling.
-            sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-            embeddings1 = sentence_embeddings[0]
-            embeddings2 = sentence_embeddings[1]
-            embeddings1 /= embeddings1.norm(dim=-1, keepdim=True)
-            embeddings2 /= embeddings2.norm(dim=-1, keepdim=True)
-
-            cosine_scores = embeddings1 @ embeddings2.t()
-            scores.append(cosine_scores.item())
-        max_score = max(scores)
-        index = scores.index(max_score)
+        with torch.no_grad():
+            sent_embd = s_bert.encode(f"I want you to act like {character}")
+        
+        scores = s_bert.similarity(sent_embd, profile_embds).squeeze(0)
+        index = scores.argmax().item()
         embd_key = list(ROLE_PROFILE_MAPPING.keys())[index]
-            
-        model.global_role_embd.append(ROLE_PROFILE_MAPPING[embd_key])
 
-    with open(args.infer_path, 'r') as file:
+        print("Most similar role_embd: ", embd_key)
+        model.global_role_embd.clear()
+        model.global_role_embd.append(ROLE_PROFILE_MAPPING[embd_key].to(model.device))
+
+        if hasattr(model, "role_ids"):
+            model.role_ids.clear()
+            model.role_ids.append(torch.LongTensor([index]).to(device=model.device))
+    
+    multi = "for_multiturn_" if args.multi_turns else ""
+    infer_path = os.path.join(args.infer_path, f"generated_agent_interview_{multi}{character}.json")
+    with open(infer_path, 'r') as file:
         test_set = []
         if args.multi_turns:
             for line in file:
@@ -130,11 +138,13 @@ def main(args):
                 test_set.append(json_obj)
         else:
             test_set = json.load(file)
-    for i, one in enumerate(tqdm(test_set)):
+    
+    suffix = "multi" if args.multi_turns else "single"
+    for i, one in enumerate(tqdm(test_set,  
+                                 desc=f"Evaluating {character}/{suffix}")):
         if i < args.resume_id - 1:
             continue
         if args.multi_turns:
-            pass
             inputs = []
             for j in range(one["max_turns"]):
                 inputs.append({
@@ -142,19 +152,16 @@ def main(args):
                     "action": one["content"][2 * j]["turn_content"][0]["action"],
                     "content": one["content"][2 * j]["turn_content"][0]["content"],
                 })
-                res = evaluate(tokenizer=tokenizer, model=model, character=args.character, inputs=inputs)
+                res = evaluate(tokenizer=tokenizer, model=model, character=character, inputs=inputs)
                 one["content"][2 * j + 1]["turn_content"][0]["content"] = res
                 inputs.append({
                     "role": one["content"][2 * j + 1]["turn_content"][0]["role"],
                     "action": one["content"][2 * j + 1]["turn_content"][0]["action"],
                     "content": one["content"][2 * j + 1]["turn_content"][0]["content"],
                 })
-            if not os.path.exists(args.save_path):
-                with open(args.save_path, 'w') as file:
-                    pass
-            with open(args.save_path, 'a') as file:
-                json.dump(one, file)
-                file.write('\n')
+            
+            eval_results.append(one)
+            
         else:
             outline = {
                 "topic_id": one["topic_id"],
@@ -165,21 +172,22 @@ def main(args):
                 "action": "(speaking)",
                 "content": one["question"]
             }]
-            res = evaluate(model=model, tokenizer=tokenizer, character=args.character, inputs=inputs)
+            res = evaluate(model=model, tokenizer=tokenizer, character=character, inputs=inputs)
             reply = {
-                "role": args.character,
+                "role": character,
                 "action": "(speaking)",
                 "content": res,
             }
-            outline["reply"] = reply
-            if not os.path.isfile(args.save_path):
-                with open(args.save_path, 'w') as file:
-                    json.dump([], file)
-            with open(args.save_path, 'r+') as file:
-                file_data = json.load(file)
-                file_data.append(outline)
-                file.seek(0)
-                json.dump(file_data, file, indent=4)
+            outline["reply"] = reply    
+            eval_results.append(outline)
+
+    if args.multi_turns:
+        result = [json.dumps(res, ensure_ascii=False) for res in eval_results]
+        result = "\n".join(result)
+    else:
+        result = json.dumps(eval_results, ensure_ascii=False, indent=4)
+
+    return result
 
 if __name__ == "__main__":
     args = parse_arguments()

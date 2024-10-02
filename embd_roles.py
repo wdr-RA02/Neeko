@@ -1,9 +1,8 @@
 import os
 import torch
-from transformers import (
-    AutoTokenizer,
-    AutoModel
-)
+from sentence_transformers import SentenceTransformer
+
+from tqdm import tqdm
 
 ROLE_PROFILE_MAPPING={
     "Beethoven": "",
@@ -27,8 +26,9 @@ def read_profile(path):
         agent_profile.append(p.strip())
     return agent_profile[0]
 
+
 def main(
-    encoder_path: str = '/path/to/your/deberta-v3-large',
+    encoder_path: str = "dunzhang/stella_en_400M_v5",
     seed_data_path: str = '/path/to/your/seed_data',
     save_path: str = '/path/to/save/your/role_embds'
     ):
@@ -39,15 +39,12 @@ def main(
     for k in ROLE_PROFILE_MAPPING.keys():
         ROLE_PROFILE_MAPPING[k] = read_profile(os.path.join(seed_data_path, "profiles/wiki_" + k + ".txt"))
 
-    tokenizer = AutoTokenizer.from_pretrained(encoder_path)
-    encoder = AutoModel.from_pretrained(encoder_path)
+    model = SentenceTransformer(encoder_path, trust_remote_code=True).cuda()
 
-    for k,v in ROLE_PROFILE_MAPPING.items():
-        input = tokenizer.encode(v, return_tensors="pt")
-        out = encoder(input)
-        cls_token = out.last_hidden_state[:, 0, :].reshape(-1)
+    for k,v in tqdm(ROLE_PROFILE_MAPPING.items()):
+        # print(v)
+        cls_token = model.encode(v, convert_to_tensor=True)
         torch.save(cls_token, os.path.join(save_path, k + ".pth"))
-
 
 if __name__ == "__main__":
     from jsonargparse import CLI
