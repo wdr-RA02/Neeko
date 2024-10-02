@@ -45,6 +45,7 @@ from .tuners import (
     PromptEmbedding,
     PromptEncoder,
     MoeLoraModel,
+    MoeLoraConfig
 )
 from .utils import (
     SAFETENSORS_WEIGHTS_NAME,
@@ -909,6 +910,14 @@ class PeftModelForCausalLM(PeftModel):
             return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
 
     def generate(self, **kwargs):
+        if isinstance(self.active_peft_config, MoeLoraConfig):
+            if "role_embds" in kwargs:
+                self.base_model.global_role_embd.clear()
+                self.base_model.global_role_embd.extend([kwargs.pop("role_embds")])
+            if "role_ids" in kwargs:
+                self.base_model.role_ids.clear()
+                self.base_model.role_ids.extend([kwargs.pop("role_ids")])
+        
         self.base_model.prepare_inputs_for_generation = self.prepare_inputs_for_generation
         if hasattr(self.base_model, "model"):
             self.base_model.model.generation_config = self.generation_config

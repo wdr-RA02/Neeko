@@ -11,6 +11,18 @@ import pandas as pd
 import csv
 import re
 
+ROLE_PROFILE_MAPPING={
+    "Beethoven": "",
+    "Cleopatra": "",
+    "Hermione": "",
+    "Martin": "",
+    "Newton": "",
+    "Socrates": "",
+    "Spartacus": "",
+    "Voldemort": "",
+    "Caesar": "",
+}
+
 
 def preprocess_data(
     prompt_template: Template,
@@ -26,23 +38,12 @@ def preprocess_data(
     _SYSEND = "[/SYS]"
 
     def preprocess_supervised_dataset(examples):
-        ROLE_PROFILE_MAPPING={
-            "Beethoven": "",
-            "Caesar": "",
-            "Cleopatra": "",
-            "Hermione": "",
-            "Martin": "",
-            "Newton": "",
-            "Socrates": "",
-            "Spartacus": "",
-            "Voldemort": "",
-        }
         for k in ROLE_PROFILE_MAPPING.keys():
-            ROLE_PROFILE_MAPPING[k] = torch.load(os.path.join(data_args.embds_dir, k + ".pth"))
+            ROLE_PROFILE_MAPPING[k] = torch.load(os.path.join(data_args.embds_dir, k + ".pth"), map_location="cpu")
         
         pat = re.compile(r"^(.*?)( \(.*?\): )")
         # model_inputs = {"input_ids": [], "labels": [], "role_embds": []}
-        model_inputs = {"input_ids": [], "labels": [], "role_embds": []}
+        model_inputs = {"input_ids": [], "labels": [], "role_embds": [], "role_ids": []}
         for i in range(len(examples["text"])):
             dialogs = examples["text"][i].split(examples["eot"][i])
             while len(dialogs)>0:
@@ -107,6 +108,10 @@ def preprocess_data(
             model_inputs["labels"].append(labels)
             model_inputs["role_embds"].append(ROLE_PROFILE_MAPPING[examples["role"][i]])
 
+            roles = list(ROLE_PROFILE_MAPPING.keys())
+            role_id = roles.index(examples["role"][i])
+            model_inputs["role_ids"].append(role_id)
+
         return model_inputs
 
     def print_supervised_dataset_example(example):
@@ -118,6 +123,7 @@ def preprocess_data(
                              skip_special_tokens=False)
         ))
         print("role_embds:\n{}".format(example["role_embds"]))
+        print("role_ids:\n{}".format(example["role_ids"]))
 
     preprocess_function = preprocess_supervised_dataset
 
