@@ -18,17 +18,18 @@ The interactions are as follows:"""
 
 HISTORY_TEMPLATE = f"{_SEP} " + "{role} {action}:\n{content}{eos}"
 
-def generate_prompt(character: str, inputs, eos_token:str):
-    gpt_prompt = f"{_SYS} {SYS_PROMPT_TEMPLATE.format(character=character)} {_SYS_END}\n "
+def generate_prompt(character: str, inputs, eos_token:str, bos_token:str):
+    gpt_prompt = f"{_SYS} {SYS_PROMPT_TEMPLATE.format(character=character)} {_SYS_END}\n " + eos_token
     # append history
     history = ""
     for dialog in inputs:
-        history += HISTORY_TEMPLATE.format(role=dialog["role"], action=dialog["action"], content=dialog["content"], eos=eos_token)
+        history += HISTORY_TEMPLATE.format(role=dialog["role"], action=dialog["action"], content=dialog["content"], eos="")
     
     user = " " + HISTORY_TEMPLATE.format(role=character, action="(speaking)", content="", eos="")
     gpt_prompt += (history + user)
 
     return gpt_prompt
+
 
 def evaluate(
     model: transformers.PreTrainedModel,
@@ -43,7 +44,7 @@ def evaluate(
     max_new_tokens: int=512,
     **kwargs,
 ):
-    prompt = generate_prompt(character, inputs, tokenizer.eos_token)
+    prompt = generate_prompt(character, inputs, eos_token=tokenizer.eos_token, bos_token=tokenizer.bos_token)
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     
     input_ids = inputs["input_ids"].to(model.device)
@@ -69,6 +70,25 @@ def evaluate(
 
     return output_seq
 
+def forward(
+    model: transformers.PreTrainedModel,
+    tokenizer: transformers.PreTrainedTokenizer,
+    character: str,
+    inputs: List[Dict[str,str]] = None,
+    **kwargs,
+):
+    prompt = generate_prompt(character, inputs, tokenizer.eos_token)
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    
+    input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
+    input_len = input_ids.shape[1]
+
+    output = model(input_ids=input_ids, labels=input_ids, attention_mask=attention_mask) 
+
+    return output
+
+@torch.no_grad()
 def generate(
     model: transformers.PreTrainedModel, 
     input_ids: torch.Tensor, 
@@ -85,14 +105,13 @@ def generate(
     input_ids = input_ids.to(model.device)
     attention_mask = attention_mask.to(model.device)
 
-    with torch.no_grad():
-        output = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            generation_config=generation_config,
-            return_dict_in_generate=return_dict_in_generate,
-            output_scores=output_scores,
-        )
+    output = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        generation_config=generation_config,
+        return_dict_in_generate=return_dict_in_generate,
+        output_scores=output_scores,
+    )
     
     if not return_dict_in_generate:
         output = output[input_len:].cpu()
