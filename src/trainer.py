@@ -37,7 +37,7 @@ class LLaMaTrainer:
         # Split the dataset
         if self.training_args.do_train:
             if self.data_args.dev_ratio > 1e-6:
-                self.dataset, _ = self.dataset.train_test_split(test_size=self.data_args.dev_ratio)
+                self.dataset = self.dataset.train_test_split(test_size=self.data_args.dev_ratio)
                 trainer_kwargs = {"train_dataset": self.dataset["train"], "eval_dataset": self.dataset["test"]}
             else:
                 trainer_kwargs = {"train_dataset": self.dataset}
