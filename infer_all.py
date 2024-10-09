@@ -59,16 +59,16 @@ def parse_arguments():
     parser.add_argument(
         "--resume_id", type=int, default=0
     )
-    parser.add_argument(
-        '--multi-turns', action='store_true', help='Enable multi-turns mode'
-    )
+    # parser.add_argument(
+    #     '--multi-turns', action='store_true', help='Enable multi-turns mode'
+    # )
     args = parser.parse_args()
 
     return args
 
 
 def main(args):
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    os.makedirs(args.save_path, exist_ok=True)
     tokenizer = LlamaTokenizer.from_pretrained(args.LLM, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
@@ -100,13 +100,11 @@ def main(args):
 
     for character in ROLE_PROFILE_MAPPING:
         result = eval_single(model, tokenizer, args, character=character, profile_embds=profile_embds, s_bert=s_bert)
-        suffix = "multi.jsonl" if args.multi_turns else "single.json"
 
-        with open(os.path.join(args.save_path, f"{character}_{suffix}"), "w") as f:
+        with open(os.path.join(args.save_path, f"{character}_single.json"), "w") as f:
             f.write(result)
         
         print("*"*50)
-
 
 def eval_single(model, tokenizer, args, character:str, profile_embds, s_bert):
     # select the most near character
@@ -128,64 +126,35 @@ def eval_single(model, tokenizer, args, character:str, profile_embds, s_bert):
             model.role_ids.clear()
             model.role_ids.append(torch.LongTensor([index]).to(device=model.device))
     
-    multi = "for_multiturn_" if args.multi_turns else ""
-    infer_path = os.path.join(args.infer_path, f"generated_agent_interview_{multi}{character}.json")
+    # multi = "for_multiturn_" if args.multi_turns else ""
+    infer_path = os.path.join(args.infer_path, f"generated_agent_interview_{character}.json")
     with open(infer_path, 'r') as file:
-        test_set = []
-        if args.multi_turns:
-            for line in file:
-                json_obj = json.loads(line)
-                test_set.append(json_obj)
-        else:
-            test_set = json.load(file)
+        test_set = json.load(file)
     
-    suffix = "multi" if args.multi_turns else "single"
     for i, one in enumerate(tqdm(test_set,  
-                                 desc=f"Evaluating {character}/{suffix}")):
+                                 desc=f"Evaluating {character}/single")):
         if i < args.resume_id - 1:
             continue
-        if args.multi_turns:
-            inputs = []
-            for j in range(one["max_turns"]):
-                inputs.append({
-                    "role": one["content"][2 * j]["turn_content"][0]["role"],
-                    "action": one["content"][2 * j]["turn_content"][0]["action"],
-                    "content": one["content"][2 * j]["turn_content"][0]["content"],
-                })
-                res = evaluate(tokenizer=tokenizer, model=model, character=character, inputs=inputs)
-                one["content"][2 * j + 1]["turn_content"][0]["content"] = res
-                inputs.append({
-                    "role": one["content"][2 * j + 1]["turn_content"][0]["role"],
-                    "action": one["content"][2 * j + 1]["turn_content"][0]["action"],
-                    "content": one["content"][2 * j + 1]["turn_content"][0]["content"],
-                })
-            
-            eval_results.append(one)
-            
-        else:
-            outline = {
-                "topic_id": one["topic_id"],
-                "question": one["question"],
-            }
-            inputs=[{
-                "role": "Man",
-                "action": "(speaking)",
-                "content": one["question"]
-            }]
-            res = evaluate(model=model, tokenizer=tokenizer, character=character, inputs=inputs)
-            reply = {
-                "role": character,
-                "action": "(speaking)",
-                "content": res,
-            }
-            outline["reply"] = reply    
-            eval_results.append(outline)
+        
+        outline = {
+            "topic_id": one["topic_id"],
+            "question": one["question"],
+        }
+        inputs=[{
+            "role": "Man",
+            "action": "(speaking)",
+            "content": one["question"]
+        }]
+        res = evaluate(model=model, tokenizer=tokenizer, character=character, inputs=inputs)
+        reply = {
+            "role": character,
+            "action": "(speaking)",
+            "content": res,
+        }
+        outline["reply"] = reply    
+        eval_results.append(outline)
 
-    if args.multi_turns:
-        result = [json.dumps(res, ensure_ascii=False) for res in eval_results]
-        result = "\n".join(result)
-    else:
-        result = json.dumps(eval_results, ensure_ascii=False, indent=4)
+    result = json.dumps(eval_results, ensure_ascii=False, indent=4)
 
     return result
 
